@@ -266,7 +266,7 @@ class ImprovedAnomalyDetectionTraining:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', type=str, required=True)
-    parser.add_argument('--output_dir', type=str, required=True)
+    parser.add_argument('--output_dir',ß type=str, required=True)
     args = parser.parse_args()
     
     trainer = ImprovedAnomalyDetectionTraining(args.input_dir, args.output_dir)
