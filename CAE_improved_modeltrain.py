@@ -147,7 +147,6 @@ class ImprovedAnomalyDetectionTraining:
         encoded = MaxPooling2D((2, 2), padding='same', name='encoded_output')(x) # 8x8x32
         
         # --- Decoder (独立定義) ---
-        # Decoderの入力を定義（Encoderの出力形状に合わせる）
         encoded_input = Input(shape=(8, 8, 32), name='decoder_input')
         
         x = Conv2D(32, (3, 3), activation='relu', padding='same')(encoded_input)
@@ -168,11 +167,11 @@ class ImprovedAnomalyDetectionTraining:
         encoder = Model(input_img, encoded, name='encoder')
         decoder = Model(encoded_input, decoded_output, name='decoder')
         
-        # Autoencoder全体（Encoder -> Decoder）
+        # Autoencoder全体
         autoencoder_output = decoder(encoder(input_img))
         autoencoder = Model(input_img, autoencoder_output, name='autoencoder')
         
-        # コンパイル: 学習率を 0.001 -> 0.0001 に変更（重要）
+        # コンパイル: 学習率 0.0001
         autoencoder.compile(
             optimizer=Adam(learning_rate=0.0001), 
             loss='mse',
@@ -183,18 +182,18 @@ class ImprovedAnomalyDetectionTraining:
     
     def train_autoencoder(self, cell_images):
         """オートエンコーダの訓練"""
-        print("=== Training Autoencoder ===")
+        print("=== Training Autoencoder (No Augmentation) ===")
         
         X = np.expand_dims(cell_images, axis=-1).astype('float32')
         X_train, X_val = train_test_split(X, test_size=0.2, random_state=42)
         
-        # Augmentation（必要に応じてコメントアウトして調整）
+        # === 変更点: データ拡張を無効化 ===
         datagen = ImageDataGenerator(
-            rotation_range=2,
-            width_shift_range=0.02,
-            height_shift_range=0.02,
-            zoom_range=0.02,
-            horizontal_flip=True,
+            rotation_range=0,      # 回転なし
+            width_shift_range=0,   # 平行移動なし
+            height_shift_range=0,  # 平行移動なし
+            zoom_range=0,          # 拡大縮小なし
+            horizontal_flip=True,  # 反転のみ有効（形質を変えないため安全）
             vertical_flip=True,
             fill_mode='nearest'
         )
@@ -202,11 +201,10 @@ class ImprovedAnomalyDetectionTraining:
         autoencoder, encoder, decoder = self.create_improved_autoencoder()
         autoencoder.summary()
         
-        # コールバック設定（Patienceを増加）
         callbacks = [
             EarlyStopping(
                 monitor='val_loss',
-                patience=30,  # 10 -> 30 に増加
+                patience=30,
                 restore_best_weights=True,
                 verbose=1
             ),
@@ -219,17 +217,16 @@ class ImprovedAnomalyDetectionTraining:
             ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.5,
-                patience=10,  # 5 -> 10 に増加
+                patience=10,
                 min_lr=1e-6,
                 verbose=1
             )
         ]
         
-        # 訓練実行（Epochsを増加）
         history = autoencoder.fit(
             datagen.flow(X_train, X_train, batch_size=32),
             steps_per_epoch=len(X_train) // 32,
-            epochs=300,  # 100 -> 300 に増加
+            epochs=300,
             validation_data=(X_val, X_val),
             callbacks=callbacks,
             verbose=1
@@ -237,10 +234,10 @@ class ImprovedAnomalyDetectionTraining:
         
         self.plot_training_history(history)
         
-        # モデル保存（Decoderも保存）
+        # モデル保存
         autoencoder.save(os.path.join(self.output_dir, 'final_autoencoder.keras'))
         encoder.save(os.path.join(self.output_dir, 'encoder.keras'))
-        decoder.save(os.path.join(self.output_dir, 'decoder.keras')) # Decoder保存を追加
+        decoder.save(os.path.join(self.output_dir, 'decoder.keras'))
         
         return autoencoder, encoder, history
     
@@ -280,7 +277,6 @@ class ImprovedAnomalyDetectionTraining:
         for name, detector in detectors.items():
             detector.fit(features_reduced)
         
-        # 保存
         import pickle
         with open(os.path.join(self.output_dir, 'scaler.pkl'), 'wb') as f:
             pickle.dump(scaler, f)
@@ -291,14 +287,12 @@ class ImprovedAnomalyDetectionTraining:
                 pickle.dump(detector, f)
 
 def main():
-    # 引数解析
     parser = argparse.ArgumentParser(description='Autoencoder Training for Cell Analysis')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to input images directory')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to output results directory')
     
     args = parser.parse_args()
     
-    # 実行
     trainer = ImprovedAnomalyDetectionTraining(args.input_dir, args.output_dir)
     
     # 1. データセット作成
