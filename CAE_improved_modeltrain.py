@@ -13,6 +13,7 @@ from skimage import exposure
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, UpSampling2D, BatchNormalization, LeakyReLU
 from tensorflow.keras.models import Model
+from tensorflow.keras.applications import VGG19
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from sklearn.svm import OneClassSVM
@@ -102,28 +103,37 @@ class ImprovedAnomalyDetectionTraining:
         return np.array(all_cells), stats_df
     
     def create_high_capacity_autoencoder(self, input_shape=(64, 64, 1)):
-        """容量を増やした高精度モデル"""
+        """容量を増やした高精度モデル (No Pooling, Perceptual Loss)"""
         
-        # --- Encoder ---
+        # --- Encoder (No Pooling: Strided Convolutions) ---
         input_img = Input(shape=input_shape, name='encoder_input')
         
-        # Layer 1: 64 filters (倍増)
+        # Layer 1
         x = Conv2D(64, (3, 3), padding='same')(input_img)
         x = BatchNormalization()(x)
         x = LeakyReLU(alpha=0.1)(x)
-        x = MaxPooling2D((2, 2), padding='same')(x)
+        # Replace MaxPooling with Strided Conv
+        x = Conv2D(64, (3, 3), strides=(2, 2), padding='same')(x)
+        x = BatchNormalization()(x)
+        x = LeakyReLU(alpha=0.1)(x)
         
-        # Layer 2: 128 filters (倍増)
+        # Layer 2
         x = Conv2D(128, (3, 3), padding='same')(x)
         x = BatchNormalization()(x)
         x = LeakyReLU(alpha=0.1)(x)
-        x = MaxPooling2D((2, 2), padding='same')(x)
+        # Replace MaxPooling with Strided Conv
+        x = Conv2D(128, (3, 3), strides=(2, 2), padding='same')(x)
+        x = BatchNormalization()(x)
+        x = LeakyReLU(alpha=0.1)(x)
         
-        # Layer 3: 64 filters
+        # Layer 3
         x = Conv2D(64, (3, 3), padding='same')(x)
         x = BatchNormalization()(x)
         x = LeakyReLU(alpha=0.1)(x)
-        encoded = MaxPooling2D((2, 2), padding='same', name='encoded_output')(x) # 8x8x64
+        # Replace MaxPooling with Strided Conv
+        x = Conv2D(64, (3, 3), strides=(2, 2), padding='same')(x)
+        x = BatchNormalization()(x)
+        encoded = LeakyReLU(alpha=0.1, name='encoded_output')(x) # 8x8x64
         
         # --- Decoder ---
         encoded_input = Input(shape=(8, 8, 64), name='decoder_input')
@@ -151,19 +161,37 @@ class ImprovedAnomalyDetectionTraining:
         autoencoder_output = decoder(encoder(input_img))
         autoencoder = Model(input_img, autoencoder_output, name='autoencoder')
         
-        # --- Custom Loss Function (SSIM + MAE) ---
-        def mixed_loss(y_true, y_pred):
-            # SSIM Loss (Structure Similarity)
-            ssim_loss = 1 - tf.reduce_mean(tf.image.ssim(y_true, y_pred, max_val=1.0))
-            # MAE Loss (Pixel-wise Error)
-            mae_loss = tf.reduce_mean(tf.abs(y_true - y_pred))
-            # Combine (High weight on SSIM for sharpness)
-            return 0.85 * ssim_loss + 0.15 * mae_loss
+        # --- Perceptual Loss (VGG19) ---
+        # VGG19モデルの準備 (重み固定)
+        vgg = VGG19(weights='imagenet', include_top=False, input_shape=(64, 64, 3))
+        vgg.trainable = False
+        # 特徴抽出用モデル (block3_conv3を使用)
+        loss_model = Model(inputs=vgg.input, outputs=vgg.get_layer('block3_conv3').output)
+        loss_model.trainable = False
+        
+        def perceptual_loss(y_true, y_pred):
+            # 1. MAE Loss
+            mae = tf.reduce_mean(tf.abs(y_true - y_pred))
+            
+            # 2. Perceptual Loss
+            # グレースケール(1ch)をRGB(3ch)に変換
+            y_true_rgb = tf.image.grayscale_to_rgb(y_true)
+            y_pred_rgb = tf.image.grayscale_to_rgb(y_pred)
+            
+            # 特徴量抽出
+            feat_true = loss_model(y_true_rgb)
+            feat_pred = loss_model(y_pred_rgb)
+            
+            # 特徴量間のMAE
+            feat_loss = tf.reduce_mean(tf.abs(feat_true - feat_pred))
+            
+            # 組み合わせ (MAE + 0.1 * VGG_Loss)
+            return mae + 0.1 * feat_loss
 
-        # コンパイル: Lossを mixed_loss に変更
+        # コンパイル
         autoencoder.compile(
             optimizer=Adam(learning_rate=0.0001), 
-            loss=mixed_loss,
+            loss=perceptual_loss,
             metrics=['mse', 'mae']
         )
         
@@ -266,7 +294,7 @@ class ImprovedAnomalyDetectionTraining:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_dir', type=str, required=True)
-    parser.add_argument('--output_dir',ß type=str, required=True)
+    parser.add_argument('--output_dir', type=str, required=True)
     args = parser.parse_args()
     
     trainer = ImprovedAnomalyDetectionTraining(args.input_dir, args.output_dir)
