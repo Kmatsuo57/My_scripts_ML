@@ -252,10 +252,89 @@ class MutantScreeningPipeline:
                 analysis_data['features'].append(scores['features_pca'])
                 analysis_data['sample_name'].extend([name] * len(folder_cells))
                 analysis_data['is_anomaly'].extend(scores['predictions'] == -1)
-                analysis_data['mse'].extend(scores['mse'])
         if not summary_results:
             print("No results to save.")
             return
+
+        # --- Ensure WT is included in analysis_data if available ---
+        if (generate_umap or run_extra_viz or run_quantitative) and wt_path:
+            # Check if WT was already processed from the input folders
+            wt_in_folders = False
+            wt_folder_path = None
+            for name, path in folders_dict.items():
+                if name.upper() == 'WT':
+                    wt_in_folders = True
+                    wt_folder_path = path
+                    break
+            
+            # Determine if we need to load from wt_path
+            # We load if:
+            # 1. WT was NOT found in folders
+            # 2. WT WAS found, but wt_path is a DIFFERENT directory (merge data)
+            should_load_wt = False
+            if not wt_in_folders:
+                should_load_wt = True
+                print(f"  WT not found in folders. Loading additional WT data from: {wt_path}")
+            else:
+                # Check if paths are effectively the same
+                try:
+                    if os.path.abspath(wt_path) != os.path.abspath(wt_folder_path):
+                        should_load_wt = True
+                        print(f"  WT found in folders, but --wt_path is different. Merging data from: {wt_path}")
+                    else:
+                        print(f"  WT found in folders and matches --wt_path. Using loaded data.")
+                except Exception:
+                    # In case of path errors, default to loading to be safe, or skip. 
+                    # Let's assume if we can't verify, we might skip to avoid duplication if it looks similar, 
+                    # but here we'll skip if we can't verify to be safe against double counting.
+                    pass
+
+            if should_load_wt:
+                wt_files = []
+                if os.path.isdir(wt_path):
+                    wt_files = sorted(glob(os.path.join(wt_path, '*.tif')) + glob(os.path.join(wt_path, '*.tiff')))
+                elif os.path.isfile(wt_path):
+                    wt_files = [wt_path]
+                
+                wt_cells_accum = []
+                wt_cell_metadata = [] # Keep track of file origin for detailed results
+                for wf in wt_files:
+                    w_data = self.extract_quality_cells(wf, enhance_contrast=True)
+                    for i, (raw_c, pre_c) in enumerate(w_data):
+                        wt_cells_accum.append(pre_c)
+                        wt_cell_metadata.append((wf, i))
+                
+                if wt_cells_accum:
+                    print(f"    Loaded {len(wt_cells_accum)} cells from wt_path.")
+                    wt_scores = self.compute_anomaly_scores(wt_cells_accum)
+                    
+                    # Update analysis_data (for UMAP/Clustering)
+                    analysis_data['features'].append(wt_scores['features_pca'])
+                    analysis_data['sample_name'].extend(['WT'] * len(wt_cells_accum))
+                    analysis_data['is_anomaly'].extend(wt_scores['predictions'] == -1)
+                    analysis_data['mse'].extend(wt_scores['mse'])
+                    
+                    # Update summary_results (for Phenotype Mosaic / CSV)
+                    summary_results['WT'] = {
+                        'sample_name': 'WT', 
+                        'folder_path': wt_path, 
+                        'total_cells': len(wt_cells_accum), 
+                        'anomaly_rate': wt_scores['anomaly_rate'], 
+                        'mean_mse': np.mean(wt_scores['mse']), 
+                        'is_wt': True
+                    }
+                    
+                    # Update detailed_results (for Violin Plots / XAI)
+                    for i, (score, mse) in enumerate(zip(wt_scores['anomaly_scores'], wt_scores['mse'])):
+                        f_path, local_idx = wt_cell_metadata[i]
+                        detailed_results.append({
+                            'sample_name': 'WT', 
+                            'file_path': f_path, 
+                            'local_idx': local_idx, 
+                            'anomaly_score': score, 
+                            'mse': mse
+                        })
+
         df_summary = pd.DataFrame.from_dict(summary_results, orient='index')
         df_detailed = pd.DataFrame(detailed_results)
         df_summary.to_csv(os.path.join(output_dir, 'summary_folder_mode.csv'))
@@ -265,35 +344,47 @@ class MutantScreeningPipeline:
         self.generate_phenotype_mosaic(df_summary, df_detailed, output_dir, wt_thresholds, mode='folder')
         
         # --- Run XAI Analysis (New Logic) ---
-        print("  Running XAI analysis (WT Reference & Top 2 Candidates)...")
+        print("  Running XAI analysis (WT Reference 5 cells & Top 5 Candidates)...")
         
-        # 1. WT Reference (Median MSE)
-        wt_name = next((s for s in summary_results.keys() if 'WT' in s.upper()), None)
+        # 1. WT Reference (5 cells closest to Median MSE)
+        wt_name = next((s for s in summary_results.keys() if 'WT' == s.upper() or 'WT' in s.upper()), None)
+        # Prefer exact 'WT' match if available (from our manual add), otherwise finding first partial match
+        if 'WT' in summary_results:
+             wt_name = 'WT'
+
         if wt_name:
             wt_rows = df_detailed[df_detailed['sample_name'] == wt_name]
             if not wt_rows.empty:
-                # Use MSE median for reference
-                median_row = wt_rows.sort_values('mse').iloc[len(wt_rows)//2]
-                try:
-                    w_path = median_row['file_path']
-                    w_idx = int(median_row['local_idx']) if 'local_idx' in median_row else int(median_row['cell_id'])
-                    w_data = self.extract_quality_cells(w_path, enhance_contrast=True)
-                    if w_idx < len(w_data):
-                        w_raw, w_pre = w_data[w_idx]
-                        self.visualize_residuals(w_raw, w_pre, os.path.join(output_dir, 'Reference_WT_Median_residuals.png'))
-                        self.visualize_heatmap_overlay(w_raw, w_pre, os.path.join(output_dir, 'Reference_WT_Median_heatmap.png'))
-                except Exception as e:
-                    print(f"    [Warning] Failed to generate WT Reference: {e}")
+                # Calculate median MSE
+                median_mse = wt_rows['mse'].median()
+                # Find 5 cells with MSE closest to the median
+                # We calculate the absolute difference from median and sort by it
+                # Make a copy to avoid SettingWithCopyWarning
+                wt_rows = wt_rows.copy()
+                wt_rows['diff_from_median'] = (wt_rows['mse'] - median_mse).abs()
+                median_candidates = wt_rows.sort_values('diff_from_median').head(5)
+                
+                for rank, (_, row) in enumerate(median_candidates.iterrows()):
+                    try:
+                        w_path = row['file_path']
+                        w_idx = int(row['local_idx']) if 'local_idx' in row else int(row['cell_id'])
+                        w_data = self.extract_quality_cells(w_path, enhance_contrast=True)
+                        if w_idx < len(w_data):
+                            w_raw, w_pre = w_data[w_idx]
+                            self.visualize_residuals(w_raw, w_pre, os.path.join(output_dir, f'PositiveControl_WT_Median_{rank+1}_residuals.png'))
+                            self.visualize_heatmap_overlay(w_raw, w_pre, os.path.join(output_dir, f'PositiveControl_WT_Median_{rank+1}_heatmap.png'))
+                    except Exception as e:
+                        print(f"    [Warning] Failed to generate WT Reference {rank+1}: {e}")
 
-        # 2. Top 2 Candidates per Series
+        # 2. Top 5 Candidates per Series
         for sample in df_detailed['sample_name'].unique():
             s_rows = df_detailed[df_detailed['sample_name'] == sample]
-            # Top 2 by Anomaly Score
-            top_2 = s_rows.nlargest(2, 'anomaly_score')
+            # Top 5 by Anomaly Score
+            top_5 = s_rows.nlargest(5, 'anomaly_score')
             
             safe_sample_name = "".join(c for c in sample if c.isalnum() or c in ('-', '_')).rstrip()
             
-            for rank, (_, row) in enumerate(top_2.iterrows()):
+            for rank, (_, row) in enumerate(top_5.iterrows()):
                 try:
                     c_path = row['file_path']
                     c_idx = int(row['local_idx']) if 'local_idx' in row else int(row['cell_id'])
@@ -534,34 +625,49 @@ class MutantScreeningPipeline:
             return
 
         mutant_samples = [s for s in df['sample'].unique() if s != wt_sample_name]
-
+        
+        # Colors for the comparison plots
+        # Background (Others): Gray
+        # WT: Blue (or similar distinct color)
+        # Mutant: Red (or similar distinct color)
+        
         for mutant in mutant_samples:
-            print(f"    - Comparing WT vs {mutant}")
-            sub_df = df[df['sample'].isin([wt_sample_name, mutant])]
-            comparison_color_map = {wt_sample_name: color_map.get(wt_sample_name, 'blue'), mutant: color_map.get(mutant, 'red')}
+            # Prepare plotting logic for this mutant
             
             sanitized_mutant_name = "".join(c for c in mutant if c.isalnum() or c in ('-', '_')).rstrip()
-
-            # UMAP
-            if 'UMAP1' in sub_df.columns:
-                filename = os.path.join(output_dir, f'plot_umap_WT_vs_{sanitized_mutant_name}.png')
-                self._plot_embedding(sub_df, 'UMAP1', 'UMAP2', f'UMAP: WT vs {mutant}', filename, comparison_color_map)
             
-            # PCA
-            if 'PCA1' in sub_df.columns:
-                filename = os.path.join(output_dir, f'plot_pca_WT_vs_{sanitized_mutant_name}.png')
-                self._plot_embedding(sub_df, 'PCA1', 'PCA2', f'PCA: WT vs {mutant}', filename, comparison_color_map)
+            # Helper function for scatter plot
+            def plot_highlight(x_col, y_col, plot_name, filename):
+                plt.figure(figsize=(10, 8))
+                
+                # Masks
+                mask_wt = df['sample'] == wt_sample_name
+                mask_mutant = df['sample'] == mutant
+                mask_others = ~(mask_wt | mask_mutant)
+                
+                # Plot "Others" first (background)
+                plt.scatter(df.loc[mask_others, x_col], df.loc[mask_others, y_col], 
+                            c='lightgray', alpha=0.3, s=15, label='Others', edgecolors='none')
+                
+                # Plot "WT"
+                plt.scatter(df.loc[mask_wt, x_col], df.loc[mask_wt, y_col], 
+                            c='blue', alpha=0.6, s=25, label=wt_sample_name, edgecolors='none')
+                
+                # Plot "Mutant" (Target)
+                plt.scatter(df.loc[mask_mutant, x_col], df.loc[mask_mutant, y_col], 
+                            c='red', alpha=0.8, s=30, label=mutant, edgecolors='white', linewidth=0.5)
+                
+                plt.title(f"{plot_name}: WT vs {mutant}")
+                plt.xlabel(x_col)
+                plt.ylabel(y_col)
+                plt.legend(loc='upper right')
+                plt.tight_layout()
+                plt.savefig(filename, dpi=300)
+                plt.close()
 
-            # t-SNE
-            if 'tSNE1' in sub_df.columns:
-                filename = os.path.join(output_dir, f'plot_tsne_WT_vs_{sanitized_mutant_name}.png')
-                self._plot_embedding(sub_df, 'tSNE1', 'tSNE2', f't-SNE: WT vs {mutant}', filename, comparison_color_map)
-
-            # PHATE
-            if 'PHATE1' in sub_df.columns:
-                if phate is not None:
-                    filename = os.path.join(output_dir, f'plot_phate_WT_vs_{sanitized_mutant_name}.png')
-                    self._plot_embedding(sub_df, 'PHATE1', 'PHATE2', f'PHATE: WT vs {mutant}', filename, comparison_color_map)
+            # Generate UMAP comparison
+            if 'UMAP1' in df.columns:
+                plot_highlight('UMAP1', 'UMAP2', 'UMAP', os.path.join(output_dir, f'umap_compare_WT_vs_{sanitized_mutant_name}.png'))
 
     def calculate_distribution_distances(self, df_detailed, output_dir):
         print("  Calculating distribution distances from WT...")
