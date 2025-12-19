@@ -3,7 +3,7 @@
 # --- 設定項目 ---
 
 # モデルが保存されているディレクトリのパス
-MODEL_DIR="/Users/matsuokoujirou/Documents/Data/Screening/Models/20250613_1524_improved"
+MODEL_DIR="/Users/matsuokoujirou/Documents/Data/Screening/Models/20251219_1055"
 
 # 解析対象のサンプル群が入っているルートフォルダのパス
 INPUT_DIR="/Users/matsuokoujirou/Documents/Data/Screening/Abnormal_data/alldata"
@@ -12,7 +12,7 @@ INPUT_DIR="/Users/matsuokoujirou/Documents/Data/Screening/Abnormal_data/alldata"
 WT_PATH="/Users/matsuokoujirou/Documents/Data/Screening/Noemal_cells/images"
 
 # 出力先ディレクトリ（指定しない場合は自動生成されます）
-OUTPUT_DIR="/Users/matsuokoujirou/Documents/Data/Screening/screening_results/251218/Known_mutants"
+OUTPUT_DIR="/Users/matsuokoujirou/Documents/Data/Screening/screening_results/251219/Known_mutants_04"
 
 # --- 解析の実行 ---
 
