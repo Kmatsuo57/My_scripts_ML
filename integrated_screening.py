@@ -187,15 +187,17 @@ class MutantScreeningPipeline:
         print(f"  WT Baseline Rate: {wt_rate:.2f}% | Threshold: {thresholds['threshold']:.2f}% | 99th Score: {p99_score:.2f}")
         return thresholds
 
-    def run_file_mode(self, input_paths, output_dir, wt_path=None):
-        print("\n=== Running in FILE mode ===")
+    def run_file_mode(self, input_paths, output_dir, wt_path=None, generate_umap=False, run_extra_viz=False, run_quantitative=False):
+        print(f"\n=== Running in FILE mode (UMAP: {generate_umap}, ExtraViz: {run_extra_viz}, Quantitative: {run_quantitative}) ===")
         files_dict = self._get_files_from_paths(input_paths)
         if not files_dict:
             print("No TIF files found.")
             return
         os.makedirs(output_dir, exist_ok=True)
         wt_thresholds = self._calculate_wt_baseline(wt_path) if wt_path else {'wt_rate': 0.0, 'threshold': 5.0, 'p99_score': 13.0}
-        summary_results, detailed_results = {}, []
+        
+        summary_results, detailed_results, analysis_data = {}, [], {'features': [], 'sample_name': [], 'is_anomaly': [], 'mse': []}
+        
         for name, path in files_dict.items():
             print(f"  Processing {name}...")
             cells_data = self.extract_quality_cells(path, enhance_contrast=True)
@@ -208,9 +210,76 @@ class MutantScreeningPipeline:
             summary_results[name] = {'sample_name': name, 'file_path': path, 'total_cells': len(preprocessed_cells), 'anomaly_rate': scores['anomaly_rate'], 'mean_mse': np.mean(scores['mse']), 'is_wt': 'WT' in name.upper()}
             for i, (score, mse) in enumerate(zip(scores['anomaly_scores'], scores['mse'])):
                 detailed_results.append({'sample_name': name, 'file_path': path, 'cell_id': i, 'anomaly_score': score, 'mse': mse})
+            
+            if generate_umap or run_extra_viz or run_quantitative:
+                analysis_data['features'].append(scores['features_pca'])
+                analysis_data['sample_name'].extend([name] * len(preprocessed_cells))
+                analysis_data['is_anomaly'].extend(scores['predictions'] == -1)
+                analysis_data['mse'].extend(scores['mse'])
+
         if not summary_results:
             print("No results to save.")
             return
+            
+        # --- Ensure WT is included in analysis_data if available ---
+        if (generate_umap or run_extra_viz or run_quantitative) and wt_path:
+            # Check if WT was already processed from the input files
+            wt_in_files = any(name.upper() == 'WT' or 'WT' in name.upper() for name in files_dict.keys())
+            
+            should_load_wt = False
+            if not wt_in_files:
+                should_load_wt = True
+                print(f"  WT not found in input files. Loading additional WT data from: {wt_path}")
+            else:
+                 # Check if wt_path is external to the input files being processed
+                 # For simplicity in file mode, if 'WT' is not one of the keys, we load it.
+                 # If 'WT' is in keys, we assume it's covered.
+                 pass
+
+            if should_load_wt:
+                wt_files = []
+                if os.path.isdir(wt_path):
+                    wt_files = sorted(glob(os.path.join(wt_path, '*.tif')) + glob(os.path.join(wt_path, '*.tiff')))
+                elif os.path.isfile(wt_path):
+                    wt_files = [wt_path]
+                
+                wt_cells_accum = []
+                wt_cell_metadata = [] 
+                for wf in wt_files:
+                    w_data = self.extract_quality_cells(wf, enhance_contrast=True)
+                    for i, (raw_c, pre_c) in enumerate(w_data):
+                        wt_cells_accum.append(pre_c)
+                        wt_cell_metadata.append((wf, i))
+                
+                if wt_cells_accum:
+                    print(f"    Loaded {len(wt_cells_accum)} cells from wt_path.")
+                    wt_scores = self.compute_anomaly_scores(wt_cells_accum)
+                    
+                    analysis_data['features'].append(wt_scores['features_pca'])
+                    analysis_data['sample_name'].extend(['WT'] * len(wt_cells_accum))
+                    analysis_data['is_anomaly'].extend(wt_scores['predictions'] == -1)
+                    analysis_data['mse'].extend(wt_scores['mse'])
+                    
+                    # Update summary/detailed for plots if WT wasn't in original inputs
+                    if 'WT' not in summary_results:
+                         summary_results['WT'] = {
+                            'sample_name': 'WT', 
+                            'file_path': wt_path, 
+                            'total_cells': len(wt_cells_accum), 
+                            'anomaly_rate': wt_scores['anomaly_rate'], 
+                            'mean_mse': np.mean(wt_scores['mse']), 
+                            'is_wt': True
+                        }
+                         for i, (score, mse) in enumerate(zip(wt_scores['anomaly_scores'], wt_scores['mse'])):
+                            f_path, local_idx = wt_cell_metadata[i]
+                            detailed_results.append({
+                                'sample_name': 'WT', 
+                                'file_path': f_path, 
+                                'cell_id': i, # Use global index for file mode or local
+                                'anomaly_score': score, 
+                                'mse': mse
+                            })
+
         df_summary = pd.DataFrame.from_dict(summary_results, orient='index')
         df_detailed = pd.DataFrame(detailed_results)
         df_summary.to_csv(os.path.join(output_dir, 'summary_file_mode.csv'))
@@ -218,6 +287,76 @@ class MutantScreeningPipeline:
         self.plot_anomaly_rates(df_summary, output_dir, wt_thresholds, "File")
         self.plot_violin(df_detailed, output_dir, wt_thresholds, "File")
         self.generate_phenotype_mosaic(df_summary, df_detailed, output_dir, wt_thresholds, mode='file')
+        
+        # --- Run XAI Analysis ---
+        print("  Running XAI analysis...")
+        # 1. WT Reference
+        wt_name = next((s for s in summary_results.keys() if 'WT' == s.upper() or 'WT' in s.upper()), None)
+        if wt_name:
+            wt_rows = df_detailed[df_detailed['sample_name'] == wt_name]
+            if not wt_rows.empty:
+                median_mse = wt_rows['mse'].median()
+                wt_rows = wt_rows.copy()
+                wt_rows['diff_from_median'] = (wt_rows['mse'] - median_mse).abs()
+                median_candidates = wt_rows.sort_values('diff_from_median').head(5)
+                for rank, (_, row) in enumerate(median_candidates.iterrows()):
+                    try:
+                        w_path = row['file_path']
+                        # In file mode, cell_id is the index in the file
+                        w_idx = int(row['cell_id'])
+                        w_data = self.extract_quality_cells(w_path, enhance_contrast=True)
+                        if w_idx < len(w_data):
+                            w_raw, w_pre = w_data[w_idx]
+                            self.visualize_residuals(w_raw, w_pre, os.path.join(output_dir, f'PositiveControl_WT_Median_{rank+1}_residuals.png'))
+                            self.visualize_heatmap_overlay(w_raw, w_pre, os.path.join(output_dir, f'PositiveControl_WT_Median_{rank+1}_heatmap.png'))
+                    except Exception as e:
+                         print(f"    [Warning] Failed to generate WT Reference {rank+1}: {e}")
+
+        # 2. Top 5 Candidates per File
+        for sample in df_detailed['sample_name'].unique():
+            s_rows = df_detailed[df_detailed['sample_name'] == sample]
+            top_5 = s_rows.nlargest(5, 'anomaly_score')
+            safe_sample_name = "".join(c for c in sample if c.isalnum() or c in ('-', '_')).rstrip()
+            for rank, (_, row) in enumerate(top_5.iterrows()):
+                try:
+                    c_path = row['file_path']
+                    c_idx = int(row['cell_id'])
+                    c_data = self.extract_quality_cells(c_path, enhance_contrast=True)
+                    if c_idx < len(c_data):
+                        c_raw, c_pre = c_data[c_idx]
+                        base_name = f"{safe_sample_name}_rank{rank+1}_cell{c_idx}"
+                        self.visualize_residuals(c_raw, c_pre, os.path.join(output_dir, f"xai_residuals_{base_name}.png"))
+                        self.visualize_heatmap_overlay(c_raw, c_pre, os.path.join(output_dir, f"xai_heatmap_{base_name}.png"))
+                except Exception as e:
+                    print(f"    [Warning] Failed XAI for {sample} rank {rank+1}: {e}")
+
+        # --- Run Extended Analyses ---
+        if generate_umap or run_extra_viz or run_quantitative:
+            if not analysis_data['features']:
+                print("No features found for extended analysis.")
+                return
+            
+            all_features_pca = np.concatenate(analysis_data['features'], axis=0)
+            analysis_df = pd.DataFrame({'sample': analysis_data['sample_name'], 'is_anomaly': analysis_data['is_anomaly']})
+            
+            samples = sorted(analysis_df['sample'].unique())
+            palette = sns.color_palette("tab10", len(samples))
+            color_map = dict(zip(samples, palette))
+
+            if generate_umap:
+                self.create_umap_visualization(all_features_pca, analysis_df, output_dir, color_map)
+            if run_extra_viz:
+                self.create_pca_visualization(all_features_pca, analysis_df, output_dir, color_map)
+                self.create_tsne_visualization(all_features_pca, analysis_df, output_dir, color_map)
+                self.create_phate_visualization(all_features_pca, analysis_df, output_dir, color_map)
+            
+            if generate_umap or run_extra_viz:
+                self.create_wt_vs_mutant_visualizations(analysis_df, output_dir, color_map)
+
+            if run_quantitative:
+                self.calculate_distribution_distances(df_detailed, output_dir)
+                self.perform_clustering_analysis(all_features_pca, analysis_df, output_dir, color_map)
+
         print(f"File mode processing complete. Results are in {output_dir}")
 
     def run_folder_mode(self, root_path, output_dir, generate_umap, run_extra_viz, run_quantitative, wt_path=None):
@@ -752,8 +891,9 @@ def main():
     parser.add_argument('--output_dir', help="Directory to save results. If not given, a timestamped folder will be created.")
     parser.add_argument('--wt_path', help="Path to the WT file or folder for baseline calculation. If not provided, will look for 'WT' in inputs.")
     # --- New arguments for extended analysis ---
-    parser.add_argument('--extra_viz', action='store_true', help="Generate extra visualizations (t-SNE, PCA, PHATE) in folder/umap mode.")
-    parser.add_argument('--quantitative', action='store_true', help="Perform quantitative analysis (distribution distance, clustering) in folder/umap mode.")
+    parser.add_argument('--umap', action='store_true', help="Force UMAP generation (useful for 'file' or 'folder' modes).")
+    parser.add_argument('--extra_viz', action='store_true', help="Generate extra visualizations (t-SNE, PCA, PHATE) in file/folder/umap mode.")
+    parser.add_argument('--quantitative', action='store_true', help="Perform quantitative analysis (distribution distance, clustering) in file/folder/umap mode.")
     
     args = parser.parse_args()
 
@@ -765,13 +905,15 @@ def main():
     
     try:
         pipeline = MutantScreeningPipeline(args.model_dir)
+        generate_umap = (args.mode == 'umap') or args.umap
+        
         if args.mode == 'file':
-            pipeline.run_file_mode(args.input_paths, output_dir, args.wt_path)
+            # Support extra args in file mode now
+            pipeline.run_file_mode(args.input_paths, output_dir, args.wt_path, generate_umap, args.extra_viz, args.quantitative)
         elif args.mode in ['folder', 'umap']:
             if len(args.input_paths) > 1:
                 print("Warning: In 'folder' or 'umap' mode, only the first input path is used as the root directory.")
             root_path = args.input_paths[0]
-            generate_umap = (args.mode == 'umap')
             pipeline.run_folder_mode(root_path, output_dir, generate_umap, args.extra_viz, args.quantitative, args.wt_path)
     except Exception as e:
         print(f"\n[CRITICAL ERROR] An unexpected error occurred: {e}")

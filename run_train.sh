@@ -5,13 +5,13 @@
 # ==========================================
 
 # 入力画像のフォルダパス（最後にスラッシュをつけない）
-INPUT_DIR="/Users/matsuokoujirou/Documents/Data/Screening/Noemal_cells/images"
+INPUT_DIR="/Users/matsuokoujirou/Documents/Data/imaging_data/Luca"
 
 # 出力先フォルダのルートパス
 # （実行時に日付入りサブフォルダが作成されるようにPython側で処理しても良いが、
 #   ここでは分かりやすく引数として日付フォルダを指定する）
 DATE_STR=$(date "+%Y%m%d_%H%M")
-OUTPUT_DIR="/Users/matsuokoujirou/Documents/Data/Screening/Models/${DATE_STR}"
+OUTPUT_DIR="/Users/matsuokoujirou/Documents/Data/imaging_data/Luca/Models/${DATE_STR}"
 
 # ==========================================
 # Execution
